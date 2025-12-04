@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tablero de Rol Colaborativo - D&D 5e</title>
+    <!-- Carga de Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Carga de Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, setDoc, arrayUnion, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Configuración de Firebase y variables globales
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'dnd-collaborative-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db = null;
+        let auth = null;
+        let userId = null;
+        const GAME_ID = "juego_unico"; // Usamos un ID de juego fijo para esta aplicación de un solo archivo.
+        const GAME_PATH = `artifacts/${appId}/public/data/dnd_campaigns/${GAME_ID}`;
+        
+        // Estado local de la aplicación
+        let gameState = { players: [], turn_order: [], current_turn_index: 0, dice_history: [], map_url: "https://placehold.co/800x600/1e293b/94a3b8?text=Mapa+de+la+Aventura", dj_id: null };
+
+        // -----------------------------------------------------------
+        // 1. CONFIGURACIÓN Y AUTENTICACIÓN
+        // -----------------------------------------------------------
+
+        /** Inicializa Firebase y autentica al usuario. */
+        async function initializeFirebase() {
+            if (!firebaseConfig) {
+                console.error("Firebase Configuración no encontrada.");
+                return;
+            }
+            try {
+                // setLogLevel('Debug'); // Útil para depuración
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Autenticar: Usar token si está disponible, sino, anónimo
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("Usuario autenticado. ID:", userId);
+                        document.getElementById('user-id').textContent = userId;
+                        document.getElementById('player-name-input').value = `Jugador ${Math.floor(Math.random() * 100)}`;
+                        setupRealtimeListener();
+                    } else {
+                        console.log("Usuario no autenticado.");
+                    }
+                });
+
+            } catch (error) {
+                console.error("Error al inicializar Firebase:", error);
+            }
+        }
+
+        // -----------------------------------------------------------
+        // 2. SINCRONIZACIÓN DE DATOS (Firestore)
+        // -----------------------------------------------------------
+        
+        /** Escucha cambios en tiempo real en la base de datos. */
+        function setupRealtimeListener() {
+            const docRef = doc(db, GAME_PATH);
+            
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    gameState = docSnap.data();
+                    console.log("Datos de juego recibidos:", gameState);
+                } else {
+                    console.log("No hay datos de juego. Inicializando...");
+                    initializeGameState();
+                }
+                renderApp();
+            }, (error) => {
+                console.error("Error en la escucha de Firestore:", error);
+            });
+        }
+
+        /** Inicializa el estado del juego si no existe. */
+        async function initializeGameState() {
+            const initialData = {
+                dj_id: userId,
+                players: [],
+                turn_order: [],
+                current_turn_index: 0,
+                dice_history: [{ text: "Bienvenido al juego. ¡Que empiecen las aventuras!", timestamp: serverTimestamp() }],
+                map_url: "https://placehold.co/800x600/1e293b/94a3b8?text=Mapa+de+la+Aventura+--+DJ+puede+cambiarlo",
+                music_status: 'paused',
+                music_url: 'https://cdn.pixabay.com/download/audio/2023/12/28/audio_821379761916e78887489f66085a8553.mp3?filename=adventure-music-for-rpg-games-167095.mp3'
+            };
+            try {
+                await setDoc(doc(db, GAME_PATH), initialData);
+                console.log("Estado inicial del juego guardado.");
+            } catch (e) {
+                console.error("Error al establecer el estado inicial:", e);
+            }
+        }
+
+        /** Actualiza el estado del juego completo o parcial. */
+        async function updateGameState(data) {
+            if (!db || !userId) return console.error("Base de datos no inicializada o usuario desconocido.");
+            try {
+                // Solo se permite que el DJ (el primer usuario que inició) actualice el estado
+                // En un app real, esto se manejaría con reglas de seguridad de Firebase.
+                await setDoc(doc(db, GAME_PATH), data, { merge: true });
+            } catch (e) {
+                console.error("Error al actualizar el estado del juego:", e);
+            }
+        }
+        
+        /** Agrega un nuevo evento al historial. */
+        async function addHistoryEntry(text) {
+            if (!db || !userId) return;
+            try {
+                const docRef = doc(db, GAME_PATH);
+                const player = gameState.players.find(p => p.id === userId) || { name: 'Invitado' };
+                const entry = {
+                    text: `[${player.name}] ${text}`,
+                    timestamp: serverTimestamp()
+                };
+                await setDoc(docRef, { dice_history: arrayUnion(entry) }, { merge: true });
+                // Desplazar el historial hacia abajo
+                const historyEl = document.getElementById('history-log');
+                if (historyEl) historyEl.scrollTop = historyEl.scrollHeight;
+            } catch (e) {
+                console.error("Error al agregar entrada al historial:", e);
+            }
+        }
+        
+        // -----------------------------------------------------------
+        // 3. LÓGICA DE JUEGO
+        // -----------------------------------------------------------
+
+        /** Tira un dado D20 con un modificador. */
+        async function rollD20(modifier = 0, rollType = "D20") {
+            if (!userId) return alert('Debes estar autenticado para tirar dados.');
+            
+            const roll = Math.floor(Math.random() * 20) + 1;
+            const result = roll + modifier;
+            const player = gameState.players.find(p => p.id === userId);
+            const playerName = player ? player.name : 'Invitado';
+
+            // Animación y sonido
+            animateDiceRoll(roll);
+            playDiceSound();
+
+            let resultText = `${playerName} tira ${rollType} (${roll}`;
+            if (modifier !== 0) resultText += ` + ${modifier}`;
+            resultText += `) = ${result}.`;
+            
+            if (roll === 20) resultText += " ¡Éxito Crítico!";
+            if (roll === 1) resultText += " ¡Fallo Crítico!";
+
+            // Guardar en el historial
+            await addHistoryEntry(resultText);
+        }
+
+        /** Maneja la actualización de PG o CA. */
+        async function updatePlayerStat(playerId, stat, value) {
+            const players = gameState.players.map(p => {
+                if (p.id === playerId) {
+                    const newValue = parseInt(value, 10);
+                    let historyText = "";
+
+                    if (stat === 'hp') {
+                        const diff = newValue - p.hp;
+                        if (diff > 0) historyText = `${p.name} se cura ${diff} PG. PG Totales: ${newValue}.`;
+                        else if (diff < 0) historyText = `${p.name} recibe ${-diff} de daño. PG Totales: ${newValue}.`;
+                    }
+
+                    p[stat] = newValue;
+                    if (historyText) addHistoryEntry(historyText);
+                }
+                return p;
+            });
+            await updateGameState({ players });
+        }
+        
+        /** Avanza al siguiente turno. Solo disponible para el DJ. */
+        function nextTurn() {
+            if (userId !== gameState.dj_id) return alert('Solo el Director de Juego puede avanzar el turno.');
+            if (gameState.turn_order.length === 0) return;
+
+            const nextIndex = (gameState.current_turn_index + 1) % gameState.turn_order.length;
+            const nextPlayerId = gameState.turn_order[nextIndex];
+            const nextPlayer = gameState.players.find(p => p.id === nextPlayerId);
+            
+            addHistoryEntry(`El turno avanza. ¡Es el turno de ${nextPlayer ? nextPlayer.name : 'un misterioso participante'}!`);
+            updateGameState({ current_turn_index: nextIndex });
+        }
+
+        /** Cambia el orden de los turnos. Solo disponible para el DJ. */
+        function setTurnOrder() {
+            if (userId !== gameState.dj_id) return alert('Solo el Director de Juego puede establecer el orden de los turnos.');
+            const turnOrderInput = document.getElementById('turn-order-input').value;
+            const turnOrderNames = turnOrderInput.split(',').map(s => s.trim()).filter(s => s.length > 0);
+            
+            const newTurnOrder = turnOrderNames.map(name => {
+                const player = gameState.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+                // Si el jugador existe, usa su ID. Si no, usa el nombre como ID temporal (idealmente no)
+                return player ? player.id : name; 
+            }).filter(id => id); // Filtrar solo los que tienen ID o nombre válido
+
+            if (newTurnOrder.length > 0) {
+                updateGameState({ 
+                    turn_order: newTurnOrder, 
+                    current_turn_index: 0 
+                });
+                addHistoryEntry(`El Director de Juego estableció la iniciativa: ${turnOrderNames.join(', ')}`);
+            } else {
+                 updateGameState({ 
+                    turn_order: [], 
+                    current_turn_index: 0 
+                });
+                addHistoryEntry(`El Director de Juego limpió el orden de turnos.`);
+            }
+        }
+
+        /** Permite a un usuario registrar o actualizar su personaje. */
+        async function registerPlayer() {
+            const nameInput = document.getElementById('player-name-input');
+            const newName = nameInput.value.trim();
+            if (!newName) return alert('El nombre del personaje no puede estar vacío.');
+
+            const existingPlayerIndex = gameState.players.findIndex(p => p.id === userId);
+            const baseStats = { str: 10, dex: 10, con: 10, int: 10, wis: 10, car: 10 };
+            
+            let player;
+            if (existingPlayerIndex !== -1) {
+                player = gameState.players[existingPlayerIndex];
+                if (player.name !== newName) {
+                    addHistoryEntry(`${player.name} cambió su nombre a ${newName}.`);
+                }
+                player.name = newName;
+            } else {
+                player = {
+                    id: userId,
+                    name: newName,
+                    hp: 30,
+                    max_hp: 30,
+                    ac: 12,
+                    stats: baseStats
+                };
+                addHistoryEntry(`${newName} se unió a la aventura.`);
+            }
+
+            const updatedPlayers = existingPlayerIndex !== -1 
+                ? gameState.players.map((p, i) => i === existingPlayerIndex ? player : p)
+                : [...gameState.players, player];
+
+            await updateGameState({ players: updatedPlayers });
+            document.getElementById('stats-management').classList.remove('hidden');
+        }
+
+        /** Permite al DJ cambiar la URL del mapa. */
+        function changeMapUrl() {
+            if (userId !== gameState.dj_id) return alert('Solo el Director de Juego puede cambiar el mapa.');
+            const newUrl = document.getElementById('map-url-input').value.trim();
+            if (newUrl) {
+                updateGameState({ map_url: newUrl });
+                addHistoryEntry(`El Director de Juego actualizó el mapa.`);
+            } else {
+                alert('La URL del mapa no puede estar vacía.');
+            }
+        }
+
+        /** Calcula el modificador de una estadística. */
+        function getModifier(score) {
+            return Math.floor((score - 10) / 2);
+        }
+
+        /** Maneja el cambio de una puntuación de atributo (FUE, DES, etc.) */
+        async function handleStatChange(stat, change) {
+            const playerIndex = gameState.players.findIndex(p => p.id === userId);
+            if (playerIndex === -1) return;
+
+            const currentScore = gameState.players[playerIndex].stats[stat];
+            const newScore = Math.max(1, Math.min(30, currentScore + change)); // Limitar entre 1 y 30
+
+            if (newScore !== currentScore) {
+                const updatedPlayers = gameState.players.map((p, i) => {
+                    if (i === playerIndex) {
+                        p.stats[stat] = newScore;
+                    }
+                    return p;
+                });
+                
+                // Mapeo de español a la clave de Firebase
+                const statMap = { 'FUE': 'str', 'DES': 'dex', 'CON': 'con', 'INT': 'int', 'SAB': 'wis', 'CAR': 'car' };
+                const statName = Object.keys(statMap).find(key => statMap[key] === stat);
+
+                addHistoryEntry(`${gameState.players[playerIndex].name} cambió su ${statName} de ${currentScore} a ${newScore}.`);
+                await updateGameState({ players: updatedPlayers });
+            }
+        }
+        
+        // -----------------------------------------------------------
+        // 4. FUNCIONALIDADES DE SONIDO Y ANIMACIÓN
+        // -----------------------------------------------------------
+
+        let audioContext = null;
+
+        /** Genera un sonido simple de "click" para la tirada de dados. */
+        function playDiceSound() {
+            if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            oscillator.type = 'square'; 
+            oscillator.frequency.setValueAtTime(440, audioContext.currentTime); 
+            gainNode.gain.setValueAtTime(0.5, audioContext.currentTime);
+
+            // Decay del sonido (hace que suene como un "click" o "bip" corto)
+            gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.15); 
+            
+            oscillator.start();
+            oscillator.stop(audioContext.currentTime + 0.15);
+        }
+        
+        /** Controla la música de fondo. */
+        function toggleMusic() {
+            const musicEl = document.getElementById('bg-music');
+            if (!musicEl) return;
+
+            const isPlaying = gameState.music_status === 'playing';
+            
+            if (isPlaying) {
+                musicEl.pause();
+                updateGameState({ music_status: 'paused' });
+            } else {
+                musicEl.play().catch(e => console.error("Error al reproducir música (puede requerir interacción del usuario):", e));
+                updateGameState({ music_status: 'playing' });
+            }
+        }
+        
+        /** Animación del dado D20. */
+        function animateDiceRoll(result) {
+            const diceEl = document.getElementById('d20-display');
+            diceEl.textContent = '...';
+            diceEl.classList.add('animate-spin-fast');
+            
+            setTimeout(() => {
+                diceEl.classList.remove('animate-spin-fast');
+                diceEl.textContent = result;
+                // Pequeña animación de rebote al finalizar
+                diceEl.classList.add('animate-bounce-once');
+                setTimeout(() => diceEl.classList.remove('animate-bounce-once'), 500);
+            }, 500); 
+        }
+
+        // -----------------------------------------------------------
+        // 5. RENDERIZADO Y UI
+        // -----------------------------------------------------------
+
+        /** Renderiza toda la aplicación basándose en el estado global. */
+        function renderApp() {
+            const isDJ = userId === gameState.dj_id;
+            const myPlayer = gameState.players.find(p => p.id === userId);
+
+            // 1. Renderizar Estado del Usuario
+            document.getElementById('user-id-status').textContent = isDJ ? 'Director de Juego (DJ)' : 'Jugador';
+            document.getElementById('dm-settings').classList.toggle('hidden', !isDJ);
+
+            // 2. Renderizar Pestaña de Personaje (Módulo del Jugador)
+            renderPlayerSheet(myPlayer);
+            document.getElementById('stats-management').classList.toggle('hidden', !myPlayer);
+
+            // 3. Renderizar Lista de Jugadores (Módulo Global)
+            renderPlayersList(isDJ);
+
+            // 4. Renderizar Historial
+            renderHistoryLog();
+
+            // 5. Renderizar Mapa
+            document.getElementById('map-display').style.backgroundImage = `url('${gameState.map_url}')`;
+            document.getElementById('map-url-input').value = gameState.map_url;
+
+            // 6. Renderizar Turnos
+            renderTurnTracker(isDJ);
+            
+            // 7. Renderizar Música
+            const musicButton = document.getElementById('music-toggle-btn');
+            const musicEl = document.getElementById('bg-music');
+            musicEl.src = gameState.music_url;
+            
+            if (gameState.music_status === 'playing') {
+                musicButton.textContent = '⏸️ Pausar Música';
+                musicButton.classList.remove('bg-gray-700');
+                musicButton.classList.add('bg-orange-500');
+            } else {
+                musicButton.textContent = '🎵 Reproducir Música';
+                musicButton.classList.remove('bg-orange-500');
+                musicButton.classList.add('bg-gray-700');
+            }
+        }
+        
+        /** Renderiza la hoja de personaje del usuario actual. */
+        function renderPlayerSheet(myPlayer) {
+            const playerSheetEl = document.getElementById('player-sheet-content');
+            if (!myPlayer) {
+                playerSheetEl.innerHTML = '<p class="text-center text-red-400">Regístrate para ver tu hoja de personaje.</p>';
+                return;
+            }
+
+            const stats = myPlayer.stats;
+            const statAbbreviations = { str: 'FUE', dex: 'DES', con: 'CON', int: 'INT', wis: 'SAB', car: 'CAR' };
+
+            let statsHtml = '';
+            for (const key in stats) {
+                const score = stats[key];
+                const mod = getModifier(score);
+                const color = mod >= 0 ? 'text-green-400' : 'text-red-400';
+
+                statsHtml += `
+                    <div class="p-3 bg-gray-700 rounded-lg shadow-md flex flex-col items-center">
+                        <span class="text-xs font-bold uppercase text-gray-400">${statAbbreviations[key]} (${score})</span>
+                        <div class="flex items-center space-x-2 mt-1">
+                            <button onclick="window.handleStatChange('${key}', -1)" class="bg-red-600 hover:bg-red-700 text-white w-6 h-6 rounded-full text-lg leading-none">-</button>
+                            <span class="text-2xl font-extrabold ${color}">${mod >= 0 ? '+' : ''}${mod}</span>
+                            <button onclick="window.handleStatChange('${key}', 1)" class="bg-green-600 hover:bg-green-700 text-white w-6 h-6 rounded-full text-lg leading-none">+</button>
+                        </div>
+                        <button onclick="window.rollD20(${mod}, '${statAbbreviations[key]}')" class="mt-2 w-full text-xs bg-indigo-500 hover:bg-indigo-600 p-1 rounded-md transition duration-200">Tirar</button>
+                    </div>
+                `;
+            }
+
+            playerSheetEl.innerHTML = `
+                <div class="grid grid-cols-2 gap-4 mb-4">
+                    <div class="bg-gray-700 p-3 rounded-lg shadow-xl">
+                        <span class="text-xs font-medium text-gray-400">Puntos de Golpe (PG)</span>
+                        <input type="number" id="hp-input" value="${myPlayer.hp}" 
+                               onchange="window.updatePlayerStat('${myPlayer.id}', 'hp', this.value)"
+                               class="w-full mt-1 p-2 text-xl bg-gray-800 border-none rounded-md font-bold text-center focus:ring-2 focus:ring-indigo-500">
+                        <span class="text-xs text-gray-400">Máx: ${myPlayer.max_hp}</span>
+                    </div>
+                    <div class="bg-gray-700 p-3 rounded-lg shadow-xl flex flex-col justify-center items-center">
+                        <span class="text-xs font-medium text-gray-400">Clase de Armadura (CA)</span>
+                        <input type="number" id="ac-input" value="${myPlayer.ac}" 
+                               onchange="window.updatePlayerStat('${myPlayer.id}', 'ac', this.value)"
+                               class="w-full mt-1 p-2 text-xl bg-gray-800 border-none rounded-md font-bold text-center focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    ${statsHtml}
+                </div>
+            `;
+        }
+        
+        /** Renderiza la lista de todos los jugadores. */
+        function renderPlayersList(isDJ) {
+            const listEl = document.getElementById('players-list');
+            listEl.innerHTML = '';
+            
+            gameState.players.forEach(player => {
+                const isCurrentTurn = gameState.turn_order[gameState.current_turn_index] === player.id;
+                const turnIndicator = isCurrentTurn 
+                    ? '<span class="text-yellow-400 text-lg">➡️</span>' 
+                    : '';
+                const listItem = document.createElement('li');
+                listItem.className = `flex justify-between items-center p-3 mb-2 rounded-lg transition duration-200 ${isCurrentTurn ? 'bg-indigo-900 shadow-lg border-2 border-yellow-400 scale-[1.01]' : 'bg-gray-700 shadow-md'}`;
+                listItem.innerHTML = `
+                    <div class="flex items-center space-x-3">
+                        ${turnIndicator}
+                        <div>
+                            <p class="font-bold text-white">${player.name} ${player.id === gameState.dj_id ? ' (DJ)' : ''}</p>
+                            <p class="text-xs text-gray-300">ID: ${player.id.substring(0, 8)}...</p>
+                        </div>
+                    </div>
+                    <div class="text-right">
+                        <p class="text-sm text-red-400 font-bold">PG: ${player.hp} / ${player.max_hp}</p>
+                        <p class="text-xs text-blue-400">CA: ${player.ac}</p>
+                    </div>
+                `;
+                listEl.appendChild(listItem);
+            });
+        }
+        
+        /** Renderiza el historial de campaña. */
+        function renderHistoryLog() {
+            const historyEl = document.getElementById('history-log');
+            
+            // Guarda la posición de scroll
+            const shouldScroll = historyEl.scrollTop + historyEl.clientHeight >= historyEl.scrollHeight - 50; 
+
+            historyEl.innerHTML = '';
+            gameState.dice_history
+                .sort((a, b) => (a.timestamp?.seconds || 0) - (b.timestamp?.seconds || 0))
+                .slice(-100) // Mostrar solo las últimas 100 entradas
+                .forEach(entry => {
+                    const time = entry.timestamp ? new Date(entry.timestamp.seconds * 1000).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }) : 'Ahora';
+                    const messageClass = entry.text.includes('Crítico') ? 'text-yellow-300 font-bold' : 'text-gray-200';
+                    const listItem = document.createElement('div');
+                    listItem.className = 'text-sm mb-1';
+                    listItem.innerHTML = `<span class="text-gray-500 mr-2">[${time}]</span><span class="${messageClass}">${entry.text}</span>`;
+                    historyEl.appendChild(listItem);
+                });
+                
+            // Vuelve a aplicar el scroll si estaba al fondo
+            if (shouldScroll) {
+                historyEl.scrollTop = historyEl.scrollHeight;
+            } else if (historyEl.scrollHeight > historyEl.clientHeight) {
+                // Si el historial es nuevo y grande, desplazar abajo por defecto
+                 if (gameState.dice_history.length > 5 && historyEl.scrollTop === 0) {
+                     historyEl.scrollTop = historyEl.scrollHeight;
+                 }
+            }
+        }
+        
+        /** Renderiza el rastreador de turnos. */
+        function renderTurnTracker(isDJ) {
+            const trackerEl = document.getElementById('turn-tracker-list');
+            trackerEl.innerHTML = '';
+            const orderInputEl = document.getElementById('turn-order-input');
+
+            // Actualizar el campo de texto del orden
+            const playerNames = gameState.turn_order
+                .map(id => gameState.players.find(p => p.id === id)?.name || id)
+                .join(', ');
+            orderInputEl.value = playerNames;
+
+            if (gameState.turn_order.length === 0) {
+                trackerEl.innerHTML = '<p class="text-gray-400 text-center">No hay orden de turnos. DJ: Ingresa los nombres arriba, separados por comas.</p>';
+                return;
+            }
+
+            gameState.turn_order.forEach((id, index) => {
+                const player = gameState.players.find(p => p.id === id);
+                if (!player) return; // Jugador no encontrado
+
+                const isCurrent = index === gameState.current_turn_index;
+                const listItem = document.createElement('li');
+                listItem.className = `p-2 mb-1 rounded-md shadow-md transition duration-200 ${isCurrent ? 'bg-green-700 text-white font-bold scale-[1.02]' : 'bg-gray-600 text-gray-300'}`;
+                listItem.textContent = `${index + 1}. ${player.name} (PG: ${player.hp})`;
+                trackerEl.appendChild(listItem);
+            });
+        }
+
+
+        // Exponer funciones necesarias al ámbito global para los eventos onClick
+        window.initializeFirebase = initializeFirebase;
+        window.rollD20 = rollD20;
+        window.updatePlayerStat = updatePlayerStat;
+        window.nextTurn = nextTurn;
+        window.setTurnOrder = setTurnOrder;
+        window.registerPlayer = registerPlayer;
+        window.handleStatChange = handleStatChange;
+        window.changeMapUrl = changeMapUrl;
+        window.toggleMusic = toggleMusic;
+
+        // Iniciar la aplicación al cargar la ventana
+        window.onload = initializeFirebase;
+
+    </script>
+    <style>
+        /* Estilos personalizados para el dado animado y el fondo */
+        @keyframes spin-fast {
+            from { transform: rotateY(0deg); }
+            to { transform: rotateY(360deg); }
+        }
+        .animate-spin-fast {
+            animation: spin-fast 0.2s linear infinite;
+        }
+        @keyframes bounce-once {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-10px); }
+        }
+        .animate-bounce-once {
+            animation: bounce-once 0.5s ease-out;
+        }
+
+        .map-container {
+            background-size: cover;
+            background-position: center;
+            min-height: 600px;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white font-sans antialiased p-4">
+    <div class="max-w-7xl mx-auto space-y-6">
+
+        <!-- Encabezado y Estado de Conexión -->
+        <header class="bg-gray-800 p-4 rounded-xl shadow-2xl flex flex-col sm:flex-row justify-between items-center border-b-4 border-indigo-600">
+            <h1 class="text-3xl font-extrabold text-indigo-400 tracking-wider">Tablero de Rol Colaborativo D&D</h1>
+            <div class="text-sm text-right mt-2 sm:mt-0">
+                <p class="text-gray-400">Estado: <span id="user-id-status" class="font-medium text-yellow-400">Cargando...</span></p>
+                <p class="text-gray-500 text-xs">Tu ID de Sesión: <span id="user-id"></span></p>
+            </div>
+        </header>
+
+        <!-- Controles y Música Globales -->
+        <div class="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4">
+            <!-- Sección de Dados y Controles Rápidos -->
+            <div class="bg-gray-800 p-4 rounded-xl shadow-xl flex-grow flex items-center justify-between border border-gray-700">
+                <div class="flex items-center space-x-4">
+                    <button id="music-toggle-btn" onclick="window.toggleMusic()" class="px-4 py-2 rounded-full bg-gray-700 text-white font-bold shadow-lg transition duration-300 hover:scale-105">
+                        🎵 Reproducir Música
+                    </button>
+                    <audio id="bg-music" loop preload="auto" src="https://cdn.pixabay.com/download/audio/2023/12/28/audio_821379761916e78887489f66085a8553.mp3?filename=adventure-music-for-rpg-games-167095.mp3"></audio>
+                </div>
+                <!-- Animación de Dado D20 -->
+                <div class="flex flex-col items-center">
+                    <p class="text-xs text-gray-400 uppercase font-medium">Última Tirada D20</p>
+                    <div id="d20-display" class="w-16 h-16 flex items-center justify-center text-4xl font-extrabold bg-indigo-600 rounded-lg shadow-2xl cursor-pointer select-none border-2 border-indigo-400 hover:bg-indigo-500 transition duration-150" onclick="window.rollD20()">
+                        20
+                    </div>
+                </div>
+                <button onclick="window.rollD20(0, 'D20 Simple')" class="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-full font-bold shadow-lg transition duration-300 hover:scale-105">
+                    Tirar D20
+                </button>
+            </div>
+        </div>
+
+        <!-- Panel Principal (Mapa y Historial) -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- Columna del Mapa y Rastreador de Turnos -->
+            <div class="lg:col-span-2 space-y-6">
+                
+                <!-- Visor del Mapa -->
+                <div class="bg-gray-800 p-4 rounded-xl shadow-2xl border border-gray-700">
+                    <h2 class="text-xl font-bold text-indigo-400 mb-2">Mapa Táctico de la Campaña</h2>
+                    <div id="map-display" class="map-container rounded-lg shadow-inner border border-gray-600 transition duration-300">
+                        <!-- El fondo se establece con JS -->
+                    </div>
+                </div>
+
+                <!-- Rastreador de Turnos -->
+                <div class="bg-gray-800 p-4 rounded-xl shadow-2xl border border-gray-700">
+                    <h2 class="text-xl font-bold text-indigo-400 mb-4">Rastreador de Turnos</h2>
+                    <div class="space-y-3" id="turn-controls">
+                        <!-- Controles del DJ -->
+                        <div id="dm-settings" class="hidden bg-gray-700 p-3 rounded-lg flex flex-col space-y-2">
+                             <label for="turn-order-input" class="text-sm font-medium text-gray-300">Orden de Iniciativa (Nombres, separados por coma):</label>
+                            <div class="flex space-x-2">
+                                <input type="text" id="turn-order-input" placeholder="Jugador 1, Monstruo A, Jugador 2" class="flex-grow p-2 rounded-md bg-gray-800 border border-gray-600 text-white">
+                                <button onclick="window.setTurnOrder()" class="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-md font-bold transition duration-200">Establecer Orden</button>
+                                <button onclick="window.nextTurn()" class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-md font-bold transition duration-200">Siguiente Turno ➡️</button>
+                            </div>
+                            
+                            <label for="map-url-input" class="text-sm font-medium text-gray-300 pt-2">URL de la Imagen del Mapa (DJ):</label>
+                            <div class="flex space-x-2">
+                                <input type="text" id="map-url-input" placeholder="URL de la imagen del mapa" class="flex-grow p-2 rounded-md bg-gray-800 border border-gray-600 text-white">
+                                <button onclick="window.changeMapUrl()" class="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 rounded-md font-bold transition duration-200">Cambiar Mapa</button>
+                            </div>
+                        </div>
+                    </div>
+                    <ul id="turn-tracker-list" class="mt-4 space-y-2">
+                        <!-- Lista de turnos renderizada por JS -->
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Columna de Historial y Personajes -->
+            <div class="lg:col-span-1 space-y-6">
+                
+                <!-- Historial de Campaña -->
+                <div class="bg-gray-800 p-4 rounded-xl shadow-2xl border border-gray-700">
+                    <h2 class="text-xl font-bold text-indigo-400 mb-2">Historial y Tiradas</h2>
+                    <div id="history-log" class="h-64 overflow-y-auto bg-gray-900 p-3 rounded-md border border-gray-700 text-sm text-gray-200 scrollbar-thin scrollbar-thumb-gray-600 scrollbar-track-gray-800">
+                        <!-- Historial renderizado por JS -->
+                        <p class="text-center text-gray-500">Cargando historial...</p>
+                    </div>
+                </div>
+
+                <!-- Hoja de Personaje / Registro -->
+                <div class="bg-gray-800 p-4 rounded-xl shadow-2xl border border-gray-700">
+                    <h2 class="text-xl font-bold text-indigo-400 mb-4">Hoja de Personaje</h2>
+
+                    <div id="player-registration" class="space-y-3 pb-4 border-b border-gray-700 mb-4">
+                        <label for="player-name-input" class="text-sm font-medium text-gray-300">Tu Nombre de Personaje:</label>
+                        <div class="flex space-x-2">
+                            <input type="text" id="player-name-input" placeholder="Ej: Kael el Bardo" class="flex-grow p-2 rounded-md bg-gray-700 border border-gray-600 text-white">
+                            <button onclick="window.registerPlayer()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-md font-bold transition duration-200">Registrar / Actualizar</button>
+                        </div>
+                    </div>
+
+                    <div id="stats-management" class="hidden">
+                        <h3 class="text-lg font-semibold text-gray-200 mb-3">Estadísticas y Puntuaciones</h3>
+                        <div id="player-sheet-content">
+                            <!-- Hoja de personaje renderizada por JS -->
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Lista de Jugadores (Resumen Rápido) -->
+                <div class="bg-gray-800 p-4 rounded-xl shadow-2xl border border-gray-700">
+                    <h2 class="text-xl font-bold text-indigo-400 mb-4">Jugadores Activos</h2>
+                    <ul id="players-list" class="space-y-2">
+                        <!-- Lista de jugadores renderizada por JS -->
+                        <p class="text-center text-gray-500">Buscando compañeros de aventura...</p>
+                    </ul>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</body>
+</html>
